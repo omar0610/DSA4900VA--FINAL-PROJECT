@@ -1,0 +1,234 @@
+---
+title: "MatchaHaven1"
+author: "OMAR MOHAMUD"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Matcha Haven Revenue Forecasting & Regression Analysis
+
+## Purpose:
+
+### Complete pipeline for loading Excel data, fitting ARIMA/ETS,
+
+### 12-week (Oct-Dec) weekly revenue forecast (aggregated sums), accuracy evaluation, visualizations, and DayOfWeek regression tie-in.
+
+## Deliverable
+
+### Outputs and Visuals will imported into Power BI as tables and images to populate the Forecasting & Regression Analysis Page.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# 0. Install & Load Libraries (Run Once)
+if (!require("readxl")) install.packages("readxl")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("lubridate")) install.packages("lubridate")
+if (!require("forecast")) install.packages("forecast")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("gridExtra")) install.packages("gridExtra")
+if (!require("scales")) install.packages("scales")
+if (!require("knitr")) install.packages("knitr")
+if (!require("stringr")) install.packages("stringr")  # For str_pad
+
+library(tidyr)
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(forecast)
+library(ggplot2)
+library(gridExtra)
+library(scales)
+library(knitr)
+library(stringr)
+
+# 1. Load & Prep Data
+file_path <- "C:\\Users\\OMAR\\Downloads\\MatchaHaven1.xlsx"
+df <- read_excel(file_path)
+
+# Auto-detect date and revenue columns
+date_candidates <- c("Datetime", "DateTime", "timestamp", "Timestamp", "Date", "date")
+revenue_candidates <- c("TotalAmount", "Amount", "total_amount", "revenue", "Revenue", "Sales")
+
+date_col <- intersect(names(df), date_candidates)[1]
+revenue_col <- intersect(names(df), revenue_candidates)[1]
+
+if (is.na(date_col) || is.na(revenue_col)) {
+  cat("Available columns:\n")
+  print(names(df))
+  stop("Could not auto-detect Date or Revenue column. Edit candidates above.")
+}
+
+cat("Using Date column:", date_col, "| Revenue column:", revenue_col, "\n")
+
+df[[date_col]] <- as.POSIXct(df[[date_col]])
+df[[revenue_col]] <- as.numeric(df[[revenue_col]])
+
+# Aggregate to daily revenue
+df_daily <- df %>%
+  mutate(Date = as.Date(!!sym(date_col))) %>%
+  group_by(Date) %>%
+  summarise(
+    Revenue = sum(!!sym(revenue_col), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(Date) %>%
+  filter(!is.na(Date), Revenue > 0)
+
+# Fill gaps with mean (optional)
+full_dates <- seq(min(df_daily$Date), max(df_daily$Date), by = "day")
+df_daily <- df_daily %>%
+  complete(Date = full_dates) %>%
+  mutate(Revenue = ifelse(is.na(Revenue), mean(Revenue, na.rm = TRUE), Revenue))
+
+cat("df_daily summary: Rows =", nrow(df_daily), "| Date range:", range(df_daily$Date), "\n")
+
+if (nrow(df_daily) < 2) {
+  stop("Insufficient data (<2 rows). Check Excel.")
+}
+
+start_date <- min(df_daily$Date)
+
+# Time series object
+ts_data <- ts(df_daily$Revenue, start = c(year(start_date), yday(start_date)), frequency = 365.25)
+
+# Raw plot
+p_raw <- autoplot(ts_data) + 
+  labs(title = "Daily Revenue Time Series", x = "Date", y = "Revenue (KSh)") +
+  theme_minimal()
+print(p_raw)
+
+# 2. Model Fitting & Diagnostics
+# ARIMA
+fit_arima <- auto.arima(ts_data, seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+cat("\nARIMA Summary:\n")
+summary(fit_arima)
+checkresiduals(fit_arima)
+
+# ETS
+fit_ets <- ets(ts_data)
+cat("\nETS Summary:\n")
+summary(fit_ets)
+checkresiduals(fit_ets)
+
+# 3. Forecasting (Next 12 Weeks, Weekly Aggregation)
+n_forecast <- 84  # 12 weeks
+fc_arima <- forecast(fit_arima, h = n_forecast)
+fc_ets <- forecast(fit_ets, h = n_forecast)
+
+future_dates <- seq(max(df_daily$Date) + 1, by = "day", length.out = n_forecast)
+forecast_df <- data.frame(
+  Date = future_dates,
+  ARIMA = as.numeric(fc_arima$mean),
+  ARIMA_Lower = as.numeric(fc_arima$lower[,2]),
+  ARIMA_Upper = as.numeric(fc_arima$upper[,2]),
+  ETS = as.numeric(fc_ets$mean),
+  ETS_Lower = as.numeric(fc_ets$lower[,2]),
+  ETS_Upper = as.numeric(fc_ets$upper[,2])
+) %>%
+  mutate(
+    Ensemble = (ARIMA + ETS) / 2,
+    Week_Start = floor_date(Date, "week")  # Monday start for weeks
+  )
+
+# Aggregate to weekly sums
+forecast_weekly <- forecast_df %>%
+  group_by(Week_Start) %>%
+  summarise(
+    ARIMA = sum(ARIMA),
+    ETS = sum(ETS),
+    Ensemble = sum(Ensemble),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(c(ARIMA, ETS, Ensemble), ~ round(.x, 0)),
+    Week_Label = paste("Week of", format(Week_Start, "%b %d"))
+  ) %>%
+  arrange(Week_Start)
+
+cat("\n12-Week Revenue Forecast (KSh, Weekly Sums):\n")
+print(kable(forecast_weekly[, c("Week_Label", "ARIMA", "ETS", "Ensemble")], digits = 0))
+
+write.csv(forecast_weekly, "MatchaHaven_Forecast_12Weeks_Weekly.csv", row.names = FALSE)
+
+# 4. Model Comparison (Holdout: Last ~12 Weeks)
+holdout_days <- min(84, floor(nrow(df_daily) * 0.2))  # 84 or 20% fallback
+if (nrow(df_daily) < holdout_days + 1) {
+  cat("\nWARNING: Skipping holdout (insufficient data).\n")
+  accuracy_df <- data.frame(Model = character(0), RMSE = numeric(0), MAE = numeric(0), MAPE = numeric(0))
+} else {
+  train_end <- nrow(df_daily) - holdout_days
+  ts_train <- ts(df_daily$Revenue[1:train_end], start = c(year(start_date), yday(start_date)), frequency = 365.25)
+  ts_test <- ts(df_daily$Revenue[(train_end+1):nrow(df_daily)], start = end(ts_train) + 1/frequency(ts_train), frequency = 365.25)
+
+  fit_arima_train <- auto.arima(ts_train, seasonal = TRUE)
+  fit_ets_train <- ets(ts_train)
+  fc_arima_test <- forecast(fit_arima_train, h = holdout_days)$mean
+  fc_ets_test <- forecast(fit_ets_train, h = holdout_days)$mean
+
+  accuracy_df <- data.frame(
+    Model = c("ARIMA", "ETS"),
+    RMSE = c(accuracy(fc_arima_test, ts_test)["Test set", "RMSE"], 
+             accuracy(fc_ets_test, ts_test)["Test set", "RMSE"]),
+    MAE = c(accuracy(fc_arima_test, ts_test)["Test set", "MAE"], 
+            accuracy(fc_ets_test, ts_test)["Test set", "MAE"]),
+    MAPE = c(accuracy(fc_arima_test, ts_test)["Test set", "MAPE"], 
+             accuracy(fc_ets_test, ts_test)["Test set", "MAPE"])
+  )
+}
+
+cat("\nModel Accuracy on Holdout:\n")
+print(kable(accuracy_df, digits = 2))
+
+best_model <- if (nrow(accuracy_df) > 0) accuracy_df$Model[which.min(accuracy_df$RMSE)] else "N/A"
+cat("Recommended Model:", best_model, "\n")
+
+# 5. Visualizations
+# Forecast plot (daily for detail, last 30 days historical + 84 forecast)
+recent_df <- bind_rows(
+  df_daily %>% slice_tail(n = 30) %>% mutate(Source = "Historical"),
+  forecast_df %>% mutate(Source = "Forecast", Revenue = Ensemble)
+)
+p_forecast <- ggplot(recent_df, aes(x = Date, y = Revenue, color = Source)) +
+  geom_line(alpha = 0.7) +
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = ARIMA_Lower, ymax = ARIMA_Upper), alpha = 0.2, fill = "blue", inherit.aes = FALSE) +
+  geom_ribbon(data = forecast_df, aes(x = Date, ymin = ETS_Lower, ymax = ETS_Upper), alpha = 0.2, fill = "green", inherit.aes = FALSE) +
+  labs(title = "Revenue Forecast (Ensemble; 12 Weeks Ahead)",
+       x = "Date", y = "Daily Revenue (KSh)",
+       subtitle = paste("Best Model:", best_model, "| Weekly Aggr. in CSV")) +
+  theme_minimal() +
+  scale_x_date(date_breaks = "2 weeks", date_labels = "%b %d") +
+  scale_color_manual(values = c("Historical" = "black", "Forecast" = "purple"))
+print(p_forecast)
+
+# Enhanced Weekly bar chart: Dates, values on bars
+p_weekly <- ggplot(forecast_weekly, aes(x = Week_Label, y = Ensemble)) +
+  geom_col(fill = "steelblue", alpha = 0.7, width = 0.8) +
+  geom_text(aes(label = paste0(format(Ensemble, big.mark = ","), " KSh")), vjust = -0.3, size = 3.5) +
+  labs(title = "12-Week Revenue Forecast (Ensemble Weekly Sums)",
+       x = "Week", y = "Revenue (KSh)",
+       subtitle = "Values shown above bars") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        plot.title = element_text(size = 14, face = "bold")) +
+  scale_y_continuous(labels = label_number(scale_cut = scales::cut_short_scale()))
+print(p_weekly)
+
+# 6. Regression Tie-In (Fixed Labels - Full Names, Unordered Factor)
+df_daily$DayOfWeek <- factor(wday(df_daily$Date, label = TRUE, abbr = FALSE), ordered = FALSE)  # Full names, unordered
+df_daily$DayOfWeek <- relevel(df_daily$DayOfWeek, ref = "Monday")  # Baseline: Monday (now exists)
+contrasts(df_daily$DayOfWeek) <- contr.treatment(levels(df_daily$DayOfWeek))  # Dummy contrasts for real names
+lm_daily <- lm(Revenue ~ DayOfWeek, data = df_daily)
+cat("\nDaily Regression Summary (DayOfWeek effects vs. Monday baseline):\n")
+print(summary(lm_daily))
+
+cat("\nAnalysis Complete!\n")
+cat("Outputs: CSV saved, plots printed. ARIMA/ETS ensemble for stability.\n")
+
+# Save plots
+ggsave("Revenue_Forecast_12Weeks.png", p_forecast, width = 12, height = 6, dpi = 300)
+ggsave("Weekly_Bar_12Weeks.png", p_weekly, width = 12, height = 7, dpi = 300)
+
+
+```

@@ -1,0 +1,480 @@
+---
+title: "Match Haven Forecasting and Regression Analysis"
+author: "OMAR MOHAMUD"
+date: "2025-10-14"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+input_path <- normalizePath(
+  "C:/Users/OMAR/Downloads/MatchaHaven1.xlsx",  # forward slashes only
+  winslash = "/", mustWork = TRUE
+)
+stopifnot(file.exists(input_path))
+
+```
+
+# Introduction
+
+## Goal
+
+### Provide a 12-week revenue forecast (Oct–Dec) and identify key revenue drivers.
+
+## Approach
+
+### 1) Clean & aggregate transactions to weekly revenue.
+
+### 2) fit ARIMA and ETS models with backtesting.
+
+### 3) create a simple ensemble average, and run a multiple regression on transaction-level data to explain drivers (hour, day, order type).
+
+## Deliverable
+
+### Outputs and Visuals will imported into Power BI as tables and images to populate the Forecasting & Regression Analysis Page.
+
+## 1) Libraries & helpers
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+pkgs <- c(
+  "tidyverse","lubridate","readxl","scales",
+  "forecast","broom","patchwork","lmtest","nortest",
+  "sandwich","car","stringr"
+)
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Metrics
+rmse <- function(a, b) sqrt(mean((a - b)^2, na.rm = TRUE))
+mae  <- function(a, b) mean(abs(a - b), na.rm = TRUE)
+mape <- function(a, b) mean(abs((a - b) / a), na.rm = TRUE) * 100
+r2   <- function(a, b) 1 - sum((a - b)^2, na.rm = TRUE) / sum((a - mean(a, na.rm = TRUE))^2, na.rm = TRUE)
+
+# Formatters (Kenyan Shilling)
+fmt_kes     <- scales::label_currency(prefix = "KSh ", accuracy = 1, big.mark = ",")
+fmt_number  <- scales::label_comma(accuracy = 0.01)
+fmt_percent <- scales::label_percent(accuracy = 0.1)
+
+```
+
+## 2) Load, clean, and aggregate (weekly)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+raw <- readxl::read_excel(input_path)
+
+df <- raw %>%
+  dplyr::mutate(
+    Datetime    = lubridate::ymd_hms(Datetime, quiet = TRUE),
+    TotalAmount = as.numeric(TotalAmount)
+  ) %>%
+  dplyr::filter(!is.na(Datetime), !is.na(TotalAmount), TotalAmount > 0) %>%
+  dplyr::arrange(Datetime) %>%
+  dplyr::mutate(
+    HourOfDay = lubridate::hour(Datetime),
+    DayOfWeek = factor(
+      lubridate::wday(Datetime, label = TRUE, abbr = FALSE),
+      levels = c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+    ),
+    OrderType = if ("OrderType" %in% names(.)) as.factor(OrderType) else factor("Unknown")
+  )
+
+weekly <- df %>%
+  dplyr::mutate(WeekStart = lubridate::floor_date(Datetime, unit = "week", week_start = 1)) %>%
+  dplyr::group_by(WeekStart) %>%
+  dplyr::summarise(Revenue = sum(TotalAmount, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(WeekStart)
+
+tibble::tibble(
+  `Transactions` = nrow(df),
+  `Weeks`        = nrow(weekly),
+  `Date range`   = sprintf("%s → %s", min(df$Datetime), max(df$Datetime))
+)
+
+```
+
+## 3) Forecasting (ARIMA, ETS) — backtest + diagnostics
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+stopifnot(nrow(weekly) >= 24)  # ensure enough history
+
+# Holdout = last ~15% (min 4, max 8 weeks)
+test_n <- min(8, max(4, floor(nrow(weekly) * 0.15)))
+train  <- weekly %>% dplyr::slice(1:(dplyr::n() - test_n))
+test   <- weekly %>% dplyr::slice((dplyr::n() - test_n + 1):dplyr::n())
+
+y_train <- ts(train$Revenue, frequency = 52) # weekly≈yearly seasonality
+y_full  <- ts(weekly$Revenue, frequency = 52)
+
+# Train on 'train', forecast 'test'
+fit_arima_tr <- forecast::auto.arima(y_train, seasonal = TRUE, stepwise = TRUE, approximation = TRUE)
+fit_ets_tr   <- forecast::ets(y_train)
+
+f_arima_test <- forecast::forecast(fit_arima_tr, h = nrow(test))
+f_ets_test   <- forecast::forecast(fit_ets_tr,   h = nrow(test))
+
+truth      <- test$Revenue
+arima_pred <- as.numeric(f_arima_test$mean)
+ets_pred   <- as.numeric(f_ets_test$mean)
+
+bt_kpis <- tibble::tibble(
+  Model = c("ARIMA","ETS"),
+  RMSE  = c(rmse(truth, arima_pred), rmse(truth, ets_pred)),
+  MAE   = c(mae(truth, arima_pred),  mae(truth, ets_pred)),
+  MAPE  = c(mape(truth, arima_pred), mape(truth, ets_pred))
+)
+
+knitr::kable(bt_kpis, digits = 2, caption = "Backtest metrics on holdout weeks")
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Residual diagnostics on training fits
+p_arima <- forecast::checkresiduals(fit_arima_tr, plot = FALSE)
+p_ets   <- forecast::checkresiduals(fit_ets_tr,   plot = FALSE)
+
+cat("ARIMA Ljung–Box p-value:", p_arima$p.value, "\n")
+cat("ETS   Ljung–Box p-value:", p_ets$p.value,   "\n")
+
+par(mfrow = c(2,2))
+plot(residuals(fit_arima_tr), main = "ARIMA residuals"); acf(residuals(fit_arima_tr), main="ARIMA residuals ACF")
+plot(residuals(fit_ets_tr),   main = "ETS residuals");   acf(residuals(fit_ets_tr),   main="ETS residuals ACF")
+par(mfrow = c(1,1))
+
+```
+
+## 4) Refit on full data & 12-week ensemble forecast
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+fit_arima_full <- forecast::auto.arima(y_full, seasonal = TRUE, stepwise = TRUE, approximation = TRUE)
+fit_ets_full   <- forecast::ets(y_full)
+
+f_arima_12 <- forecast::forecast(fit_arima_full, h = 12)
+f_ets_12   <- forecast::forecast(fit_ets_full,   h = 12)
+
+h_dates <- tail(weekly$WeekStart, 1) + lubridate::weeks(1:12)
+
+fc_tbl <- tibble::tibble(
+  WeekStart = h_dates,
+  ARIMA     = as.numeric(f_arima_12$mean),
+  ETS       = as.numeric(f_ets_12$mean)
+) %>%
+  dplyr::mutate(Ensemble = rowMeans(dplyr::across(c(ARIMA, ETS)), na.rm = TRUE))
+
+knitr::kable(fc_tbl, digits = 2, caption = "12-week horizon: ARIMA, ETS, Ensemble")
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Visual: history + forecasts
+p_hist <- weekly %>%
+  ggplot(aes(WeekStart, Revenue)) +
+  geom_line(linewidth = 0.7) +
+  labs(title = "Weekly Revenue (History)", x = "Week", y = "Revenue") +
+  theme_minimal(base_size = 12)
+
+p_fc <- fc_tbl %>%
+  pivot_longer(-WeekStart, names_to = "Model", values_to = "Value") %>%
+  ggplot(aes(WeekStart, Value, linetype = Model)) +
+  geom_line(linewidth = 0.9) +
+  labs(title = "12-Week Forecast (ARIMA, ETS, Ensemble)", x = "Week", y = "Revenue", linetype = NULL) +
+  theme_minimal(base_size = 12)
+
+p_hist / p_fc
+
+```
+
+## 5) KPI Summary (forecast & comparison)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Core aggregates
+prior_n <- min(12, nrow(weekly))
+prior12_actual <- sum(tail(weekly$Revenue, prior_n), na.rm = TRUE)
+
+proj_total <- sum(fc_tbl$Ensemble, na.rm = TRUE)
+avg_weekly <- mean(fc_tbl$Ensemble, na.rm = TRUE)
+pct_change <- ifelse(prior12_actual > 0,
+                     (proj_total - prior12_actual) / prior12_actual,
+                     NA_real_)  # fraction
+
+# Backtest by model
+arima_bt <- bt_kpis %>% dplyr::filter(Model == "ARIMA") %>% dplyr::slice(1)
+ets_bt   <- bt_kpis %>% dplyr::filter(Model == "ETS")   %>% dplyr::slice(1)
+
+# Formatters (KES)
+fmt_kes     <- scales::label_currency(accuracy = 1, prefix = "KES ", big.mark = ",")
+fmt_number  <- scales::label_comma(accuracy = 0.01)
+fmt_percent <- scales::label_percent(accuracy = 0.1)
+
+# Build 2-column table
+rows <- tibble::tibble(
+  Metric = c(
+    "Projected Total Revenue (12w)",
+    "Avg Weekly Revenue (Forecast)",
+    "% Change vs Prior 12 Weeks",
+    "ARIMA RMSE (holdout)",
+    "ARIMA MAE (holdout)",
+    "ARIMA MAPE (holdout)",
+    "ETS RMSE (holdout)",
+    "ETS MAE (holdout)",
+    "ETS MAPE (holdout)"
+  ),
+  Value = c(
+    fmt_kes(proj_total),
+    fmt_kes(avg_weekly),
+    ifelse(is.na(pct_change), "NA", fmt_percent(pct_change)),
+    if (nrow(arima_bt)) fmt_number(arima_bt$RMSE) else "NA",
+    if (nrow(arima_bt)) fmt_number(arima_bt$MAE)  else "NA",
+    if (nrow(arima_bt)) fmt_percent(arima_bt$MAPE / 100) else "NA",
+    if (nrow(ets_bt))   fmt_number(ets_bt$RMSE)   else "NA",
+    if (nrow(ets_bt))   fmt_number(ets_bt$MAE)    else "NA",
+    if (nrow(ets_bt))   fmt_percent(ets_bt$MAPE / 100) else "NA"
+  )
+)
+
+# Append regression metrics if available
+if (exists("reg_metrics")) {
+  rows <- dplyr::bind_rows(
+    rows,
+    tibble::tibble(
+      Metric = c("Regression RMSE (holdout)",
+                 "Regression MAE (holdout)",
+                 "Regression MAPE (holdout)",
+                 "Regression R² (holdout)"),
+      Value = c(
+        fmt_number(reg_metrics$RMSE[1]),
+        fmt_number(reg_metrics$MAE[1]),
+        fmt_percent(reg_metrics$MAPE[1] / 100),
+        formatC(reg_metrics$R2[1], digits = 3, format = "f")
+      )
+    )
+  )
+}
+
+# Render
+knitr::kable(rows, col.names = c("Metric", "Value"), align = c("l","r"),
+             caption = "KPI summary (KES, forecast, backtest, and regression)")
+
+```
+
+## 6) Regression (drivers)
+
+```{r}
+# --- EXECUTIVE DRIVER ANALYSIS (Final Clean Version) ---
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(scales)
+library(broom)
+library(gridExtra)
+library(stringr)
+
+# --- 1. Ensure clean factors before model ---
+df <- df %>%
+  dplyr::mutate(
+    HourOfDay  = if ("HourOfDay" %in% names(df)) as.numeric(HourOfDay) else lubridate::hour(Datetime),
+    DayOfWeek  = if ("DayOfWeek" %in% names(df)) as.character(DayOfWeek) else as.character(lubridate::wday(Datetime, label = TRUE, abbr = FALSE)),
+    OrderType  = if ("OrderType" %in% names(df)) as.character(OrderType) else "Unknown",
+    TotalAmount = as.numeric(TotalAmount)
+  )
+
+# Force DayOfWeek to be *unordered categorical* for readable coefficients
+dow_levels <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+df$DayOfWeek <- factor(df$DayOfWeek, levels = dow_levels, ordered = FALSE)
+df$OrderType <- factor(df$OrderType, ordered = FALSE)
+
+# --- 2. Fit regression model ---
+lm_model <- lm(TotalAmount ~ HourOfDay + DayOfWeek + OrderType, data = df)
+
+# --- 3. Extract readable coefficients ---
+coefs <- broom::tidy(lm_model) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::mutate(
+    Driver = term %>%
+      str_replace("DayOfWeek", "") %>%
+      str_replace("OrderType", "Order Type: ") %>%
+      str_replace("HourOfDay", "Hour of Day") %>%
+      trimws(),
+    Direction = ifelse(estimate > 0, "Increases revenue", "Decreases revenue"),
+    Impact = estimate
+  )
+
+# --- 4. Split top positive & negative drivers ---
+top_increase <- coefs %>%
+  dplyr::filter(Impact > 0) %>%
+  dplyr::slice_max(order_by = Impact, n = 3) %>%
+  dplyr::select(Driver, Direction)
+
+top_decrease <- coefs %>%
+  dplyr::filter(Impact < 0) %>%
+  dplyr::slice_min(order_by = Impact, n = 3) %>%
+  dplyr::select(Driver, Direction)
+
+# --- 5. Display side-by-side tables ---
+gridExtra::grid.arrange(
+  gridExtra::tableGrob(top_increase, rows = NULL, theme = gridExtra::ttheme_default(core=list(fg_params=list(cex=1.0)))),
+  gridExtra::tableGrob(top_decrease, rows = NULL, theme = gridExtra::ttheme_default(core=list(fg_params=list(cex=1.0)))),
+  ncol = 2,
+  top = "Top 3 Drivers Increasing vs Decreasing Revenue"
+)
+
+# --- 6. Executive Bar Chart ---
+coefs_plot <- coefs %>%
+  mutate(Impact_Type = ifelse(Impact > 0, "Increases Revenue", "Decreases Revenue"))
+
+ggplot(coefs_plot, aes(x = reorder(Driver, Impact), y = Impact, fill = Impact_Type)) +
+  geom_col(width = 0.6, show.legend = TRUE) +
+  coord_flip() +
+  scale_fill_manual(values = c("Increases Revenue" = "#4C763B", "Decreases Revenue" = "#B0413E")) +
+  labs(
+    title = "Key Revenue Drivers — Positive vs Negative Impact",
+    subtitle = "Green drivers indicate revenue gains; red drivers indicate revenue decline.",
+    x = "Driver",
+    y = "Estimated Impact (KSh)",
+    fill = "Impact Type"
+  ) +
+  scale_y_continuous(labels = label_currency(prefix = "KSh ")) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 11, color = "gray25"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# EXECUTIVE DRIVER ANALYSIS (Simplified & Namespaced)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(lmtest)
+library(car)
+library(scales)
+library(broom)
+library(lubridate)
+
+# Prepare dataset
+df <- df %>% 
+  dplyr::mutate(
+    HourOfDay  = if ("HourOfDay" %in% names(df)) as.numeric(HourOfDay) else lubridate::hour(Datetime),
+    DayOfWeek  = if ("DayOfWeek" %in% names(df)) factor(DayOfWeek) else lubridate::wday(Datetime, label = TRUE),
+    OrderType  = if ("OrderType" %in% names(df)) factor(OrderType) else factor("Unknown"),
+    TotalAmount = as.numeric(TotalAmount)
+  ) %>%
+  tidyr::drop_na(TotalAmount)
+
+# Fit regression model
+lm_model <- stats::lm(TotalAmount ~ HourOfDay + DayOfWeek + OrderType, data = df)
+
+# Identify top 3 drivers
+coefs <- broom::tidy(lm_model) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::arrange(dplyr::desc(abs(estimate))) %>%
+  dplyr::mutate(
+    Direction = ifelse(estimate > 0, "Increases revenue", "Decreases revenue"),
+    Impact = estimate,
+    Impact_KSh = scales::label_currency(prefix = "KSh ")(Impact)
+  )
+
+top3 <- head(coefs, 3) %>%
+  dplyr::select(Driver = term, Direction, `Impact (KSh)` = Impact_KSh)
+
+knitr::kable(top3, caption = "Top 3 Revenue Drivers")
+
+# Plot: Drivers vs. Impact
+ggplot2::ggplot(coefs, ggplot2::aes(x = reorder(term, abs(estimate)), y = estimate, fill = estimate > 0)) +
+  ggplot2::geom_col(show.legend = FALSE) +
+  ggplot2::coord_flip() +
+  ggplot2::scale_fill_manual(values = c("#B0413E", "#4C763B")) +
+  ggplot2::labs(title = "Driver Impact on Revenue",
+                x = "Driver", y = "Estimated Impact (KSh)") +
+  ggplot2::scale_y_continuous(labels = scales::label_currency(prefix = "KSh ")) +
+  ggplot2::theme_minimal(base_size = 13)
+
+# Model Quality (Executive Summary)
+metrics <- data.frame(
+  R2   = summary(lm_model)$r.squared,
+  RMSE = sqrt(mean(lm_model$residuals^2)),
+  MAE  = mean(abs(lm_model$residuals)),
+  MAPE = mean(abs(lm_model$residuals / mean(df$TotalAmount))) * 100
+)
+
+metrics$Summary <- paste0(
+  "R² = ", round(metrics$R2, 2), " (",
+  ifelse(metrics$R2 > 0.7, "Strong", ifelse(metrics$R2 > 0.4, "Moderate", "Weak")), " fit)\n",
+  "RMSE = ", round(metrics$RMSE, 2), ", MAE = ", round(metrics$MAE, 2), "\n",
+  "MAPE ≈ ", round(metrics$MAPE, 1), "% error on average"
+)
+
+knitr::kable(metrics["Summary"], caption = "Model Quality Summary (executive interpretation)")
+
+# Model Health Checks (fixed & consistent)
+
+bp_p <- tryCatch(lmtest::bptest(lm_model)$p.value, error = function(e) NA)
+
+# VIF - take maximum only
+vif_vals <- tryCatch(car::vif(lm_model), error = function(e) NA)
+max_vif <- suppressWarnings(
+  if (length(vif_vals) > 1) max(vif_vals, na.rm = TRUE) else as.numeric(vif_vals)
+)
+
+# Influential points
+infl <- stats::cooks.distance(lm_model)
+n_infl <- sum(infl > 4 / length(infl), na.rm = TRUE)
+
+# Build table with equal-length columns
+health <- tibble::tibble(
+  Check  = c("Heteroskedasticity (uneven variance)",
+             "Multicollinearity (VIF)",
+             "Influential points"),
+  Status = c(
+    ifelse(is.na(bp_p), "N/A", ifelse(bp_p < 0.05, "⚠️ Check", "✅ OK")),
+    ifelse(is.na(max_vif), "N/A", ifelse(max_vif > 10, "⚠️ High", "✅ OK")),
+    ifelse(is.na(n_infl), "N/A", ifelse(n_infl > 0, paste0("⚠️ ", n_infl, " flagged"), "✅ OK"))
+  ),
+  Detail = c(
+    ifelse(is.na(bp_p),
+           "Test unavailable",
+           paste0("p = ", formatC(bp_p, digits = 3, format = "f"),
+                  ifelse(bp_p < 0.05, " → possible heteroskedasticity", " → no strong issue"))),
+    ifelse(is.na(max_vif),
+           "VIF unavailable",
+           paste0("Max VIF = ", formatC(max_vif, digits = 2, format = "f"),
+                  ifelse(!is.na(max_vif) && max_vif > 10, " (simplify predictors recommended)", ""))),
+    ifelse(is.na(n_infl),
+           "Cook’s D unavailable",
+           paste0(n_infl, " above threshold (4/n = ", formatC(4 / length(infl), digits = 4, format = "f"), ")"))
+  )
+)
+
+knitr::kable(health, caption = "Model Health Check Results (Revenue Drivers Model)")
+
+
+# Transaction Context (expanded)
+txn_context <- df %>%
+  dplyr::summarise(
+    Average = mean(TotalAmount, na.rm = TRUE),
+    Median  = median(TotalAmount, na.rm = TRUE),
+    Min     = min(TotalAmount, na.rm = TRUE),
+    Max     = max(TotalAmount, na.rm = TRUE),
+    P90     = quantile(TotalAmount, 0.9, na.rm = TRUE),
+    P95     = quantile(TotalAmount, 0.95, na.rm = TRUE),
+    SD      = sd(TotalAmount, na.rm = TRUE)
+  ) %>%
+  dplyr::mutate(dplyr::across(everything(), ~ scales::label_currency(prefix = "KSh ")(.)))
+
+knitr::kable(txn_context, caption = "Transaction Value Context (Customer Spending Summary)")
+
+```
+
+## 7) Reproducibility
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+sessionInfo()
+```
