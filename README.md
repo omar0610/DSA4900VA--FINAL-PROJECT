@@ -56,8 +56,8 @@ DSA4900VA-FINAL-PROJECT/
 
 ## 📈 Results & Insights
 - **Forecast**: Q4 KSh 5.56M total (weekly avg KSh 463K); Sat/Sun peaks ~KSh 80K/day.
-- **Insights**: Takeaway 55% orders (KSh 8K avg); top item (Classic Mocha) KSh 949K; DAX trends show 2-3% WoW growth.
-- **Model Perf**: Ensemble RMSE 49.5K (93% better than baseline lm, MAPE <10%).
+- **Insights**: Delivery/Takeaway 76% orders (KSh 8K avg); top item (Classic Mojito) KSh 949K; DAX trends show 2-3% WoW growth.
+- **Model Perf**: Ensemble RMSE 13K (93% better than baseline lm, MAPE <16%).
 - **Dashboard Highlights**: DAX enables what-ifs (e.g., [YoY Growth] = DIVIDE([Total] - SAMEPERIODLASTYEAR([Total]), SAMEPERIODLASTYEAR([Total]))); slicers for DayOfWeek/OrderType.
 
 See report for visuals (e.g., forecast line with intervals, weekly bars).
@@ -65,15 +65,10 @@ See report for visuals (e.g., forecast line with intervals, weekly bars).
 ## 🤝 Contributing
 - Fork the repo and submit PRs for improvements (e.g., add holiday regressors).
 - Issues: Report bugs or suggest DAX tweaks.
-- Contact: omar.mohamud@usiu.ac.ke | [LinkedIn](https://linkedin.com/in/omar-anis-mohamud).
+- Contact: oanis@usiu.ac.ke
 
 ## 📄 License
 MIT License—use freely for non-commercial SME analytics. © 2025 Omar Anis A. Mohamud (USIU-Africa DSA4900VA).
-
-## 📚 References
-- Shmueli et al. (2020). *Data Mining for Business Analytics: Using R*.
-- Mudzana & Maharaj (2020). BI Frameworks for SMEs.
-- Full list in [Project Proposal](DSA4900VA Draft 1.docx).
 
 ---
 
