@@ -1,7 +1,6 @@
 ---
 title: "Match Haven Forecasting and Regression Analysis"
 author: "OMAR MOHAMUD"
-date: "2025-10-14"
 output: word_document
 ---
 
