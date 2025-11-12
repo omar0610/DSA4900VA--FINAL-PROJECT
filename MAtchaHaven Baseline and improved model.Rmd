@@ -1,0 +1,846 @@
+---
+title: "MatchaHaven1 - final model"
+author: "OMAR MOHAMUD"
+date: "2025-11-10"
+output: word_document
+---
+
+```{r 1. setup, include=FALSE}
+options(stringsAsFactors = FALSE)
+set.seed(42)
+RNGkind(kind = "Mersenne-Twister", normal.kind = "Inversion")
+options(contrasts = c("contr.treatment", "contr.poly"))
+
+# Function to install packages if missing
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {
+    install.packages(new_packages, dependencies = TRUE)
+  }
+}
+
+# List of required packages
+packages <- c("tidyverse", "readxl", "lubridate", "forecast", "ranger", "e1071", "slider", "ggplot2", "yardstick", "kableExtra")
+
+# Install if missing (fully suppress output)
+invisible(suppressPackageStartupMessages(
+  suppressWarnings(
+    suppressMessages(install_if_missing(packages))
+  )
+))
+
+# Load packages (fully suppress output)
+invisible(suppressWarnings(
+  suppressPackageStartupMessages({
+    library(tidyverse)
+    library(readxl)
+    library(lubridate)
+    library(forecast)
+    library(ranger)
+    library(e1071)
+    library(slider)
+    library(ggplot2)
+    library(yardstick)
+    library(kableExtra)
+  })
+))
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.6)
+```
+
+# Matcha Haven Revenue Forecasting & Regression Analysis
+
+```{r 2. helpers for reproducibility}
+assert_cols <- function(df, cols, name = "data frame") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss)) stop(sprintf("missing columns in %s: %s", name, paste(miss, collapse = ", ")))
+}
+
+ordered_dow <- function(d) {
+  lv <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+  factor(d, levels = lv, ordered = TRUE)
+}
+
+rmse <- function(a, p) sqrt(mean((a - p)^2, na.rm = TRUE))
+mae  <- function(a, p) mean(abs(a - p), na.rm = TRUE)
+```
+
+```{r 3. Load integrated dataset}
+sales_path <- "C:/Users/OMAR/Downloads/MatchaHaven1.xlsx"
+
+sales_raw <- read_excel(sales_path, sheet = "Sales") %>% 
+  mutate(Datetime = as_datetime(Datetime, tz = "UTC"))
+
+inv_raw <- read_excel(sales_path, sheet = "Inventory")
+
+assert_cols(sales_raw, c("Datetime","ItemName","Category","Qty","TotalAmount"), "Sales")
+assert_cols(inv_raw,   c("Date","Item","Category","OpeningStock","Purchases","Sales","Waste","ClosingStock","ReorderFlag","ReorderPoint","TargetStock","AvgDailySales"), "Inventory")
+
+date_range_sales <- range(as_date(sales_raw$Datetime))
+date_range_inv   <- range(as_date(inv_raw$Date))
+list(sales_span = date_range_sales, inv_span = date_range_inv)
+```
+
+```{r 4. daily revenue preparation}
+daily_rev <- sales_raw %>%
+  mutate(Date = as_date(Datetime)) %>%
+  group_by(Date) %>%
+  summarise(Revenue = sum(TotalAmount, na.rm = TRUE), .groups = "drop") %>%
+  arrange(Date) %>%
+  mutate(DayOfWeek = ordered_dow(weekdays(Date)))
+
+stopifnot(nrow(daily_rev) >= 60)
+
+# Daily summaries
+daily_summary <- daily_rev %>%
+  summarise(
+    Mean_Daily = mean(Revenue),
+    Min_Daily = min(Revenue),
+    Max_Daily = max(Revenue),
+    SD_Daily = sd(Revenue)
+  )
+
+# Weekly aggregation and summaries
+weekly_rev <- daily_rev %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Revenue = sum(Revenue), .groups = "drop") %>%
+  arrange(Week)
+
+weekly_summary <- weekly_rev %>%
+  summarise(
+    Mean_Weekly = mean(Revenue),
+    Min_Weekly = min(Revenue),
+    Max_Weekly = max(Revenue),
+    SD_Weekly = sd(Revenue)
+  )
+daily_summary
+weekly_summary
+```
+
+```{r 5. integrity check inventory vs sales}
+sales_item_daily <- sales_raw %>%
+  mutate(Date = as_date(Datetime)) %>%
+  group_by(Date, Item = ItemName, Category) %>%
+  summarise(Sales_Qty = sum(Qty, na.rm = TRUE), .groups = "drop")
+
+inv_chk <- inv_raw %>%
+  mutate(Date = as_date(Date)) %>%
+  group_by(Date, Item, Category) %>%
+  summarise(Inv_Sales = sum(Sales, na.rm = TRUE), .groups = "drop") %>%
+  full_join(sales_item_daily, by = c("Date","Item","Category")) %>%
+  mutate(
+    Sales_Qty = replace_na(Sales_Qty, 0),
+    Inv_Sales = replace_na(Inv_Sales, 0),
+    Diff = Inv_Sales - Sales_Qty
+  )
+
+integrity_summary <- inv_chk %>%
+  summarise(
+    rows = n(),
+    perfect_matches = sum(Diff == 0),
+    pct_match = mean(Diff == 0) * 100,
+    max_abs_diff = max(abs(Diff), na.rm = TRUE)
+  )
+integrity_summary
+```
+
+```{r 6. full historical data as train (no split) }
+# Full data as train (ends ~2025-09-30)
+train <- daily_rev  # Full historical
+h <- 84  # 12 weeks ahead (Oct 1 - Dec 23, 2025)
+
+end_date <- max(train$Date)
+future_dates <- seq(end_date + 1, by = "day", length.out = h)
+
+list(
+  train_start = min(train$Date), 
+  train_end = end_date,
+  forecast_start = min(future_dates), 
+  forecast_end = max(future_dates),
+  h = h
+)
+```
+
+```{r 7. arima plus ets baseline}
+# Time series (weekly frequency, proper start)
+train_start_date <- min(train$Date)
+train_start_year <- year(train_start_date)
+train_start_doy <- yday(train_start_date)
+y_train_ts <- ts(train$Revenue, start = c(train_start_year, train_start_doy), frequency = 7)
+
+set.seed(42)
+fit_arima <- auto.arima(y_train_ts, seasonal = TRUE, stepwise = TRUE, approximation = FALSE)
+fit_ets   <- ets(y_train_ts)
+
+fc_arima <- forecast(fit_arima, h = h)
+fc_ets   <- forecast(fit_ets,   h = h)
+
+base_fc <- as.numeric((fc_arima$mean + fc_ets$mean) / 2)
+
+# Daily forecast DF
+base_fc_df <- data.frame(
+  Date = future_dates,
+  Forecast = base_fc,
+  Lower_80 = (fc_arima$lower[,1] + fc_ets$lower[,1]) / 2,
+  Upper_80 = (fc_arima$upper[,1] + fc_ets$upper[,1]) / 2
+) %>%
+  mutate(
+    Month = month(Date, label = TRUE),
+    Week = week(Date),
+    DayOfWeek = ordered_dow(weekdays(Date))
+  )
+
+# Daily summaries for forecast
+daily_fc_summary <- base_fc_df %>%
+  summarise(
+    Mean_Daily_Fc = mean(Forecast),
+    Min_Daily_Fc = min(Forecast),
+    Max_Daily_Fc = max(Forecast),
+    SD_Daily_Fc = sd(Forecast)
+  )
+
+# Weekly forecast aggregation
+weekly_fc <- base_fc_df %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Weekly_Forecast = sum(Forecast), .groups = "drop")
+
+weekly_fc_summary <- weekly_fc %>%
+  summarise(
+    Mean_Weekly_Fc = mean(Weekly_Forecast),
+    Min_Weekly_Fc = min(Weekly_Forecast),
+    Max_Weekly_Fc = max(Weekly_Forecast),
+    SD_Weekly_Fc = sd(Weekly_Forecast)
+  )
+
+# Monthly totals
+monthly_totals <- base_fc_df %>%
+  group_by(Month) %>%
+  summarise(Total_Forecast = sum(Forecast), .groups = "drop") %>%
+  mutate(Month_Num = match(Month, month.abb))  # For ordering if needed
+
+daily_fc_summary
+weekly_fc_summary
+monthly_totals
+base_fc_df
+```
+
+```{r 8. plot baseline}
+# Combine historical and forecast for plotting
+hist_plot_df <- train %>%
+  select(Date, Revenue) %>%
+  mutate(Series = "Historical")
+
+fc_plot_df <- base_fc_df %>%
+  select(Date, Forecast) %>%
+  rename(Revenue = Forecast) %>%
+  mutate(Series = "Baseline Forecast")
+
+plot_df <- bind_rows(hist_plot_df, fc_plot_df) %>%
+  mutate(Series = factor(Series, levels = c("Historical", "Baseline Forecast")))
+
+ggplot(plot_df, aes(Date, Revenue, color = Series)) +
+  geom_line() +
+  geom_ribbon(data = base_fc_df, aes(x = Date, ymin = Lower_80, ymax = Upper_80), 
+              inherit.aes = FALSE, alpha = 0.2, fill = "red") +
+  labs(title = "ARIMA + ETS Baseline: Historical + 12-Week Forecast (Oct-Dec 2025)", 
+       x = "Date", y = "Revenue (KES)", color = "Series") +
+  theme_minimal()
+```
+
+```{r 9. model matrices for calendar features (full + future}
+# Historical train features
+X_train <- model.matrix(Revenue ~ DayOfWeek, data = train)[, -1, drop = FALSE]
+y_train <- train$Revenue
+
+# Future features (only DayOfWeek, as lags later)
+future_feats <- data.frame(DayOfWeek = base_fc_df$DayOfWeek)
+X_future  <- model.matrix(~ DayOfWeek, data = future_feats)[, -1, drop = FALSE]
+
+stopifnot(identical(colnames(X_train), colnames(X_future)))
+```
+
+```{r 10. random forest forecast}
+set.seed(42)
+rf <- ranger(
+  formula = Revenue ~ .,
+  data = data.frame(Revenue = y_train, X_train),
+  num.trees = 300,
+  mtry = max(1, floor(ncol(X_train) / 2)),
+  min.node.size = 3,
+  importance = "impurity",
+  seed = 42,
+  keep.inbag = TRUE
+)
+
+pred_rf_fc <- predict(rf, data.frame(X_future), seed = 42)$predictions
+
+rf_fc_df <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(pred_rf_fc)
+) %>%
+  mutate(
+    Month = month(Date, label = TRUE),
+    Week = week(Date)
+  )
+
+# Daily/Weekly summaries for RF
+daily_rf_summary <- rf_fc_df %>%
+  summarise(
+    Mean_Daily_RF = mean(Forecast),
+    Min_Daily_RF = min(Forecast),
+    Max_Daily_RF = max(Forecast),
+    SD_Daily_RF = sd(Forecast)
+  )
+
+weekly_rf <- rf_fc_df %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Weekly_Forecast = sum(Forecast), .groups = "drop")
+
+weekly_rf_summary <- weekly_rf %>%
+  summarise(
+    Mean_Weekly_RF = mean(Weekly_Forecast),
+    Min_Weekly_RF = min(Weekly_Forecast),
+    Max_Weekly_RF = max(Weekly_Forecast),
+    SD_Weekly_RF = sd(Weekly_Forecast)
+  )
+
+monthly_rf_totals <- rf_fc_df %>%
+  group_by(Month) %>%
+  summarise(Total_Forecast = sum(Forecast), .groups = "drop")
+
+daily_rf_summary
+weekly_rf_summary
+monthly_rf_totals
+rf_fc_df
+```
+
+```{r 11. support vector regression forecast}
+set.seed(42)
+svr <- svm(
+  x = X_train, y = y_train,
+  kernel = "radial",
+  cost = 10,
+  epsilon = 0.1,
+  scale = TRUE,
+  type = "eps-regression"
+)
+
+pred_svr_fc <- predict(svr, X_future)
+
+svr_fc_df <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(pred_svr_fc)
+) %>%
+  mutate(
+    Month = month(Date, label = TRUE),
+    Week = week(Date)
+  )
+
+# Daily/Weekly summaries for SVR
+daily_svr_summary <- svr_fc_df %>%
+  summarise(
+    Mean_Daily_SVR = mean(Forecast),
+    Min_Daily_SVR = min(Forecast),
+    Max_Daily_SVR = max(Forecast),
+    SD_Daily_SVR = sd(Forecast)
+  )
+
+weekly_svr <- svr_fc_df %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Weekly_Forecast = sum(Forecast), .groups = "drop")
+
+weekly_svr_summary <- weekly_svr %>%
+  summarise(
+    Mean_Weekly_SVR = mean(Weekly_Forecast),
+    Min_Weekly_SVR = min(Weekly_Forecast),
+    Max_Weekly_SVR = max(Weekly_Forecast),
+    SD_Weekly_SVR = sd(Weekly_Forecast)
+  )
+
+monthly_svr_totals <- svr_fc_df %>%
+  group_by(Month) %>%
+  summarise(Total_Forecast = sum(Forecast), .groups = "drop")
+
+daily_svr_summary
+weekly_svr_summary
+monthly_svr_totals
+svr_fc_df
+```
+
+```{r 12. plot rf and svr forecasts}
+# Historical for context
+hist_cmp <- train %>%
+  select(Date, Revenue) %>%
+  mutate(Series = "Historical")
+
+# RF and SVR forecasts
+rf_cmp <- rf_fc_df %>%
+  select(Date, Forecast) %>%
+  mutate(Series = "RF Forecast") %>%
+  rename(Revenue = Forecast)
+
+svr_cmp <- svr_fc_df %>%
+  select(Date, Forecast) %>%
+  mutate(Series = "SVR Forecast") %>%
+  rename(Revenue = Forecast)
+
+cmp_df <- bind_rows(hist_cmp, rf_cmp, svr_cmp) %>%
+  mutate(Series = factor(Series, levels = c("Historical", "RF Forecast", "SVR Forecast")))
+
+ggplot(cmp_df, aes(Date, Revenue, color = Series)) +
+  geom_line() +
+  labs(title = "RF and SVR Forecasts vs Historical (Focus on Oct-Dec 2025)", 
+       x = "Date", y = "Revenue (KES)", color = "Series") +
+  theme_minimal()
+```
+
+```{r 13. residual corrected hybrid setup and forecast}
+# In-sample ensemble fits for residuals
+fit_arima_in <- as.numeric(fitted(fit_arima))
+fit_ets_in   <- as.numeric(fitted(fit_ets))
+k <- min(length(fit_arima_in), length(fit_ets_in), nrow(train))
+ens_in <- (fit_arima_in[seq_len(k)] + fit_ets_in[seq_len(k)]) / 2
+train_k <- tail(train, k)
+resid_train <- train_k$Revenue - ens_in
+
+# Extend full series with base_fc for autoregressive features
+full_hist <- bind_rows(train, tibble(Date = future_dates, Revenue = base_fc)) %>%
+  arrange(Date) %>%
+  mutate(
+    DayOfWeek = ordered_dow(weekdays(Date)),
+    rev_lag1 = lag(Revenue, 1),
+    rev_lag7 = lag(Revenue, 7),
+    ma7  = slide_dbl(Revenue, mean, .before = 6,  .complete = TRUE),
+    ma14 = slide_dbl(Revenue, mean, .before = 13, .complete = TRUE)
+  ) %>%
+  left_join(train_k %>% transmute(Date, resid_train), by = "Date")
+
+feat_cols <- c("DayOfWeek","rev_lag1","rev_lag7","ma7","ma14")
+train_rows <- which(!is.na(full_hist$resid_train))
+train_res_df <- full_hist[train_rows, c("Date","resid_train", feat_cols)]
+names(train_res_df)[2] <- "Residual"
+
+# Future features from extended series
+future_res_feats <- tail(full_hist, h)[, feat_cols]
+
+dummies <- function(df) {
+  dd <- model.matrix(~ DayOfWeek, df)[, -1, drop = FALSE]
+  cbind(df %>% select(-DayOfWeek), as.data.frame(dd))
+}
+
+Xr_train <- as.matrix(dummies(train_res_df[, feat_cols]))
+yr_train <- train_res_df$Residual
+Xr_future <- as.matrix(dummies(future_res_feats))
+
+# Align columns (now on matrices, so handle manually)
+common_cols <- intersect(colnames(Xr_train), colnames(Xr_future))
+Xr_train <- Xr_train[, common_cols, drop = FALSE]
+Xr_future <- Xr_future[, common_cols, drop = FALSE]
+
+# If missing in future, add zero columns
+miss <- setdiff(colnames(Xr_train), colnames(Xr_future))
+if (length(miss) > 0) {
+  Xr_future <- cbind(Xr_future, matrix(0, nrow = nrow(Xr_future), ncol = length(miss), 
+                                       dimnames = list(NULL, miss)))
+  Xr_future <- Xr_future[, colnames(Xr_train), drop = FALSE]
+}
+```
+
+```{r 14. residual models and hybrid forecasts}
+set.seed(42)
+rf_resid <- ranger(x = Xr_train, y = yr_train,
+                   num.trees = 400, mtry = max(1, floor(ncol(Xr_train) / 2)),
+                   min.node.size = 3, seed = 42, keep.inbag = TRUE)
+
+svr_resid <- svm(x = Xr_train, y = yr_train,
+                 kernel = "radial", cost = 10, epsilon = 0.1, scale = TRUE,
+                 type = "eps-regression")
+
+pred_rf_res_fc  <- predict(rf_resid, data = Xr_future)$predictions
+pred_svr_res_fc <- predict(svr_resid, Xr_future)
+
+hyb_rf_fc  <- base_fc + pred_rf_res_fc
+hyb_svr_fc <- base_fc + pred_svr_res_fc
+
+# Hybrid DFs
+hyb_rf_df <- data.frame(
+  Date = future_dates,
+  Forecast = hyb_rf_fc
+) %>%
+  mutate(Month = month(Date, label = TRUE), Week = week(Date))
+
+hyb_svr_df <- data.frame(
+  Date = future_dates,
+  Forecast = hyb_svr_fc
+) %>%
+  mutate(Month = month(Date, label = TRUE), Week = week(Date))
+
+# Summaries for hybrids (daily/weekly/monthly)
+daily_hyb_rf_summary <- hyb_rf_df %>%
+  summarise(
+    Mean_Daily_HybRF = mean(Forecast),
+    Min_Daily_HybRF = min(Forecast),
+    Max_Daily_HybRF = max(Forecast),
+    SD_Daily_HybRF = sd(Forecast)
+  )
+
+weekly_hyb_rf <- hyb_rf_df %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Weekly_Forecast = sum(Forecast), .groups = "drop")
+weekly_hyb_rf_summary <- weekly_hyb_rf %>%
+  summarise(
+    Mean_Weekly_HybRF = mean(Weekly_Forecast),
+    Min_Weekly_HybRF = min(Weekly_Forecast),
+    Max_Weekly_HybRF = max(Weekly_Forecast),
+    SD_Weekly_HybRF = sd(Weekly_Forecast)
+  )
+
+monthly_hyb_rf_totals <- hyb_rf_df %>%
+  group_by(Month) %>%
+  summarise(Total_Forecast = sum(Forecast), .groups = "drop")
+
+# Similar for SVR hybrid (omitted for brevity; repeat pattern)
+daily_hyb_svr_summary <- hyb_svr_df %>%
+  summarise(
+    Mean_Daily_HybSVR = mean(Forecast),
+    Min_Daily_HybSVR = min(Forecast),
+    Max_Daily_HybSVR = max(Forecast),
+    SD_Daily_HybSVR = sd(Forecast)
+  )
+
+weekly_hyb_svr <- hyb_svr_df %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week) %>%
+  summarise(Weekly_Forecast = sum(Forecast), .groups = "drop")
+weekly_hyb_svr_summary <- weekly_hyb_svr %>%
+  summarise(
+    Mean_Weekly_HybSVR = mean(Weekly_Forecast),
+    Min_Weekly_HybSVR = min(Weekly_Forecast),
+    Max_Weekly_HybSVR = max(Weekly_Forecast),
+    SD_Weekly_HybSVR = sd(Weekly_Forecast)
+  )
+
+monthly_hyb_svr_totals <- hyb_svr_df %>%
+  group_by(Month) %>%
+  summarise(Total_Forecast = sum(Forecast), .groups = "drop")
+
+daily_hyb_rf_summary 
+weekly_hyb_rf_summary
+monthly_hyb_rf_totals
+daily_hyb_svr_summary
+weekly_hyb_svr_summary
+monthly_hyb_svr_totals
+hyb_rf_df  
+hyb_svr_df
+```
+
+```{r 15. plot hybrid forecasts}
+# Historical + hybrids
+hist_hyb <- train %>%
+  select(Date, Revenue) %>%
+  mutate(Series = "Historical")
+
+hyb_rf_plot <- hyb_rf_df %>%
+  select(Date, Forecast) %>%
+  mutate(Series = "Hybrid RF") %>%
+  rename(Revenue = Forecast)
+
+hyb_svr_plot <- hyb_svr_df %>%
+  select(Date, Forecast) %>%
+  mutate(Series = "Hybrid SVR") %>%
+  rename(Revenue = Forecast)
+
+hyb_cmp_df <- bind_rows(hist_hyb, hyb_rf_plot, hyb_svr_plot) %>%
+  mutate(Series = factor(Series, levels = c("Historical", "Hybrid RF", "Hybrid SVR")))
+
+ggplot(hyb_cmp_df, aes(Date, Revenue, color = Series)) +
+  geom_line() +
+  labs(title = "Hybrid Forecasts: Historical + Residual-Corrected (Oct-Dec 2025)", 
+       x = "Date", y = "Revenue (KES)", color = "Series") +
+  theme_minimal()
+```
+
+```{r 16. inventory kpis and visuals (with weekly)}
+inv <- inv_raw %>%
+  mutate(Date = as_date(Date),
+         DaysOfCover = if_else(AvgDailySales > 0, ClosingStock / AvgDailySales, NA_real_))
+
+# Daily KPIs
+inv_kpis_daily <- list(
+  stockout_rate_daily = mean(inv$ClosingStock <= 0, na.rm = TRUE) * 100,
+  reorder_rate_daily  = mean(inv$ReorderFlag == 1, na.rm = TRUE) * 100,
+  avg_days_cover_daily = mean(inv$DaysOfCover, na.rm = TRUE)
+)
+
+# Weekly aggregation for KPIs
+weekly_inv <- inv %>%
+  mutate(Week = floor_date(Date, "week")) %>%
+  group_by(Week, Item, Category) %>%
+  summarise(
+    ClosingStock_Weekly = mean(ClosingStock),
+    AvgDailySales_Weekly = mean(AvgDailySales),
+    ReorderFlag_Weekly = mean(ReorderFlag == 1) * 100,
+    DaysOfCover_Weekly = mean(DaysOfCover, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+inv_kpis_weekly <- list(
+  stockout_rate_weekly = mean(weekly_inv$ClosingStock_Weekly <= 0, na.rm = TRUE) * 100,
+  reorder_rate_weekly  = mean(weekly_inv$ReorderFlag_Weekly, na.rm = TRUE),
+  avg_days_cover_weekly = mean(weekly_inv$DaysOfCover_Weekly, na.rm = TRUE)
+)
+
+# Pretty tibble summary
+kpi_summary <- tibble(
+  Period = c("Daily", "Weekly"),
+  Stockout_Rate = c(inv_kpis_daily$stockout_rate_daily, inv_kpis_weekly$stockout_rate_weekly),
+  Reorder_Rate = c(inv_kpis_daily$reorder_rate_daily, inv_kpis_weekly$reorder_rate_weekly),
+  Avg_Days_Cover = c(inv_kpis_daily$avg_days_cover_daily, inv_kpis_weekly$avg_days_cover_weekly)
+) %>%
+  mutate(
+    Stockout_Rate = round(Stockout_Rate, 1),
+    Reorder_Rate = round(Reorder_Rate, 1),
+    Avg_Days_Cover = round(Avg_Days_Cover, 1)
+  ) %>%
+  kableExtra::kable(
+    col.names = c("Period", "Stockout Rate (%)", "Reorder Rate (%)", "Avg. Days of Cover"),
+    caption = "Inventory KPIs: Daily vs. Weekly Averages",
+    align = "lccc",
+    digits = 1
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+
+kpi_summary
+```
+
+```{r 17. inventory top items and cover chart (daily/weekly summaries)}
+inv_item_summary_daily <- inv %>%
+  group_by(Item, Category) %>%
+  summarise(
+    Days = n(),
+    AvgDailySales = mean(Sales),
+    StockoutDays = sum(ClosingStock <= 0),
+    Reorders = sum(ReorderFlag == 1),
+    AvgDaysCover = mean(DaysOfCover, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(AvgDailySales))
+
+# Weekly item summary (fixed: use AvgDailySales_Weekly)
+inv_item_summary_weekly <- weekly_inv %>%
+  group_by(Item, Category) %>%
+  summarise(
+    Weeks = n(),
+    AvgWeeklySales = mean(AvgDailySales_Weekly * 7),  # Approx weekly from averaged daily
+    StockoutWeeks = sum(ClosingStock_Weekly <= 0),
+    AvgReorderRate = mean(ReorderFlag_Weekly, na.rm = TRUE),
+    AvgDaysCover = mean(DaysOfCover_Weekly, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(AvgWeeklySales))
+
+head(inv_item_summary_daily, 10)
+head(inv_item_summary_weekly, 10)
+```
+
+```{r 18. days of cover facets (weekly plot)}
+top_items <- inv_item_summary_daily %>% slice_max(AvgDailySales, n = 6) %>% pull(Item)
+
+# Weekly plot
+weekly_cover_plot <- weekly_inv %>%
+  filter(Item %in% top_items) %>%
+  ggplot(aes(Week, DaysOfCover_Weekly, group = Item)) +
+  geom_line() +
+  facet_wrap(~ Item, scales = "free_y") +
+  labs(title = "Weekly Days of Cover: Top Items", x = "Week", y = "Days of Cover") +
+  theme_minimal()
+
+print(weekly_cover_plot)
+```
+
+```{r 19. model performance on validation (RMSE, MAE, MAPE)}
+# Metrics from holdout validation (last ~20% historical as actuals)
+mape <- function(a, p) mean(abs((a - p) / a) * 100, na.rm = TRUE)
+
+models <- c("ARIMA/ETS Ensemble", "RF", "SVR", "Hybrid RF", "Hybrid SVR")
+preds <- list(base_fc_val, pred_rf_val, pred_svr_val, hyb_rf_val, hyb_svr_val)
+actual <- y_val
+
+metrics_df <- map_dfr(seq_along(models), ~ {
+  pred <- preds[[.x]]
+  tibble(
+    Model = models[.x],
+    RMSE = round(rmse(actual, pred), 2),
+    MAE = round(mae(actual, pred), 2),
+    MAPE = round(mape(actual, pred), 2)
+  )
+})
+
+# Identify best model (lowest RMSE)
+best_model <- metrics_df[which.min(metrics_df$RMSE), "Model"]
+
+# Pretty table with best highlighted
+library(kableExtra)
+metrics_table <- metrics_df %>%
+  kable(
+    col.names = c("Model", "RMSE (KES)", "MAE (KES)", "MAPE (%)"),
+    caption = "Model Performance on Validation Set",
+    digits = c(0, 0, 0, 1),
+    align = "lccc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(metrics_df$Model == best_model), bold = TRUE, background = "lightgreen") %>%
+  row_spec(0, bold = TRUE) %>%
+  footnote(paste("Best model (lowest RMSE):", best_model))
+
+metrics_table
+```
+
+```{r 20. 12-week forecast evaluation}
+# Bind all forecasts for comparison
+all_forecasts <- bind_rows(
+  base_fc_df %>% mutate(Model = "ARIMA/ETS Ensemble", Value = Forecast),
+  rf_fc_df %>% mutate(Model = "RF", Value = Forecast),
+  svr_fc_df %>% mutate(Model = "SVR", Value = Forecast),
+  hyb_rf_df %>% mutate(Model = "Hybrid RF", Value = Forecast),
+  hyb_svr_df %>% mutate(Model = "Hybrid SVR", Value = Forecast)
+) %>%
+  select(Model, Date, Value)
+
+# Overall summaries
+fc_summary <- all_forecasts %>%
+  group_by(Model) %>%
+  summarise(
+    Total_Forecast = round(sum(Value), 0),
+    Mean_Daily = round(mean(Value), 0),
+    SD_Daily = round(sd(Value), 0),
+    CV_Percent = round((SD_Daily / Mean_Daily) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total_Forecast))
+
+# Monthly totals per model
+monthly_fc <- all_forecasts %>%
+  mutate(Month = month(Date, label = TRUE)) %>%
+  group_by(Model, Month) %>%
+  summarise(Total_Monthly = round(sum(Value), 0), .groups = "drop") %>%
+  pivot_wider(names_from = Month, values_from = Total_Monthly, values_fill = 0)
+
+# Cross-model correlations (on daily values)
+cor_matrix <- all_forecasts %>%
+  pivot_wider(names_from = Model, values_from = Value) %>%
+  select(-Date) %>%
+  cor(use = "complete.obs") %>%
+  as.data.frame() %>%
+  rownames_to_column("Model") %>%
+  pivot_longer(-Model, names_to = "Compared_To", values_to = "Correlation") %>%
+  filter(Model < Compared_To) %>%  # Upper triangle only
+  mutate(Correlation = round(Correlation, 3))
+
+# Pretty tables
+library(kableExtra)
+
+summary_table <- fc_summary %>%
+  kable(
+    col.names = c("Model", "Total (KES)", "Mean Daily (KES)", "SD Daily (KES)", "CV (%)"),
+    caption = "12-Week Forecast Summary (Oct–Dec 2025)",
+    digits = 0,
+    align = "lcccc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+monthly_table <- monthly_fc %>%
+  kable(
+    col.names = c("Model", "October", "November", "December"),
+    caption = "Monthly Forecast Totals by Model (KES)",
+    digits = 0,
+    align = "lccc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+cor_table <- cor_matrix %>%
+  kable(
+    col.names = c("Model", "Compared To", "Correlation"),
+    caption = "Cross-Model Forecast Consistency (Daily Values)",
+    digits = 3,
+    align = "lcc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+# Output tables
+summary_table
+monthly_table
+cor_table
+
+# Interpretation note (as comment; remove if undesired)
+cat("Key Insights:\n- Higher totals suggest optimistic models (e.g., hybrids may capture trends better).\n- Low CV (<20%) indicates stable predictions; high (>50%) flags volatility (e.g., weekend spikes).\n- Correlations >0.8 mean models agree—trust ensembles more.\n")
+```
+
+```{r 21. RF Model Deep Dive}
+# Model summary
+cat("Random Forest Model Summary:\n")
+print(rf)
+if (!is.null(rf$prediction.error)) {
+  oob_rmse <- round(sqrt(rf$prediction.error), 2)
+  cat("\nOut-of-Bag (OOB) RMSE:", oob_rmse, "KES\n")
+} else {
+  cat("\nOOB RMSE: Not available (set write.forest = TRUE for next run)\n")
+}
+
+# RF Forecast KPIs
+daily_average <- round(mean(rf_fc_df$Forecast), 0)
+weekly_average <- round(mean(weekly_rf$Weekly_Forecast), 0)  # Assumes weekly_rf from prior
+total_12week <- round(sum(rf_fc_df$Forecast), 0)
+
+kpi_df <- tibble(
+  KPI = c("Daily Average", "Weekly Average", "Total Revenue for 12-Week Forecast"),
+  Value = c(daily_average, weekly_average, total_12week),
+  Unit = c("KES", "KES", "KES")
+)
+
+# Pretty KPI table
+library(kableExtra)
+kpi_table <- kpi_df %>%
+  kable(
+    col.names = c("KPI", "Value", "Unit"),
+    caption = "RF Forecast KPIs (Oct-Dec 2025)",
+    digits = 0,
+    align = "lcr"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+kpi_table
+
+# RF-specific forecast plot (historical + forward)
+hist_rf <- train %>%
+  select(Date, Revenue) %>%
+  mutate(Series = "Historical")
+
+rf_plot_df <- rf_fc_df %>%
+  select(Date, Forecast) %>%
+  rename(Revenue = Forecast) %>%
+  mutate(Series = "RF Forecast")
+
+rf_full_df <- bind_rows(hist_rf, rf_plot_df) %>%
+  mutate(Series = factor(Series, levels = c("Historical", "RF Forecast")))
+
+ggplot(rf_full_df, aes(Date, Revenue, color = Series)) +
+  geom_line(size = 1) +
+  labs(title = "RF Model: Historical Revenue + 12-Week Forecast (Oct-Dec 2025)",
+       x = "Date", y = "Revenue (KES)", color = "Series") +
+  theme_minimal() +
+  scale_color_manual(values = c("Historical" = "blue", "RF Forecast" = "red"))
+```
+
+```{r 22. session info for reproducibility}
+sessionInfo()
+```
