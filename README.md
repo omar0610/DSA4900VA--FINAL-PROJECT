@@ -34,8 +34,7 @@ Helps Matcha Haven:
 ### Setup and Run
 
 1. **Clone the Repository**
-git clone https://github.com/omar0610/DSA4900VA-FINAL-PROJECT.git
-cd DSA4900VA-FINAL-PROJECT
+git clone https: https://github.com/omar0610/DSA4900VA-FINAL-PROJECT
 
 2. **Run Forecasting in RStudio**
 - Open `MatchaHaven1 Improved model.Rmd`
