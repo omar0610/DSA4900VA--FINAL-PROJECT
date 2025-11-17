@@ -1,71 +1,236 @@
-# DSA4900VA Final Project: Matcha Haven Revenue Forecasting Dashboard
+DSA4900VA Final Project: Matcha Haven Revenue Forecasting Dashboard
 
-[![Power BI Live Dashboard](https://img.shields.io/badge/View-Live%20Dashboard-brightgreen?style=for-the-badge&logo=power-bi)](https://app.powerbi.com/view?r=eyJrIjoiZTgzYzNmNjMtZDM2MS00YzIzLThmMTAtNDQ0ZmU3NDAyNTI1IiwidCI6IjE2ZDgzZWU2LTI1NGEtNDY5ZC1hNmNjLTU0ZTJjYTIzMTNlNyIsImMiOjh9)
+📊 Project Overview
 
-## 📊 Project Overview
-This repository holds the complete code, data samples, and deliverables for my DSA4900VA final project at United States International University – Africa (USIU-Africa). The project builds a decision-support system for SMEs in Kenya's service sector, using Matcha Haven café as a case study. It integrates predictive modeling in RStudio (via RMarkdown) with interactive Power BI dashboards to forecast revenue, track KPIs, and deliver insights on sales, staffing, and customer trends.
+This repository contains the full analytical pipeline for my DSA4900VA final project at United States International University Africa. The project uses Matcha Haven café as a real world case study to build a complete business intelligence and forecasting system that connects RStudio predictive modeling with an interactive Power BI dashboard.
 
-**Core Innovation**: Turns manual sales records (~17,577 rows) into 12-week forecasts (Oct-Dec 2025: KSh 5.56M total, avg KSh 463K/week) using ARIMA/ETS ensembles, visualized in a 4-page Power BI dashboard with DAX measures for real-time slicing (e.g., by OrderType or DayOfWeek).
+The dashboard provides a multi perspective view of the business, including revenue trends, inventory stability, employee productivity, customer behaviour patterns, and twelve week revenue forecasts for October to December 2025.
 
-**Impact**: Helps Matcha Haven proactively manage weekends (Sat/Sun ~KSh 80K/day peaks) and mid-week dips, targeting 5-10% profitability boost. Broader: Affordable analytics template for Nairobi SMEs.
+Core Innovation
+Transforms raw daily sales logs (about 17577 rows) into a complete decision support solution:
 
-**Tech Stack**:
-- **RStudio**: Forecasting (forecast package), reports (RMarkdown).
-- **Power BI**: Dashboards with DAX (e.g., [Revenue Growth] = DIVIDE([Total] - PREVIOUSMONTH([Total]), [Total])).
-- **Data**: Manual Excel logs; cleaned CSV for import.
+Five page Power BI dashboard
 
-## 🚀 Quick Start
-### Prerequisites
-- R/RStudio (v4.0+; install packages: `install.packages(c("readxl", "dplyr", "tidyr", "lubridate", "forecast", "ggplot2", "knitr"))`).
-- Power BI Desktop (free; Pro for sharing the live dashboard).
-- Git (optional).
+Revenue forecasting using Random Forest, ARIMA, ETS, and hybrid models
 
-### Setup & Run
-1. **Clone the Repo**: git clone https://github.com/omar0610/DSA4900VA-FINAL-PROJECT.git
+Real time DAX measures for slicing insights by date, order type, employee, category, and payment method
+
+Full operational intelligence across sales, inventory, staffing, customers, and upcoming performance
+
+Business Impact
+Helps Matcha Haven:
+
+Anticipate weekend demand (Saturday and Sunday peaks)
+
+Track waste and category level stock movement
+
+Measure employee efficiency by shift and payment method
+
+Understand customer preferences and spending
+
+Plan for Q4 2025 using stable and credible forecasts
+
+🚀 Quick Start
+Prerequisites
+
+R and RStudio (with packages: readxl, dplyr, tidyr, lubridate, forecast, ggplot2, knitr)
+
+Power BI Desktop
+
+Git (optional)
+
+Setup and Run
+
+Clone the Repository
+
+git clone https://github.com/omar0610/DSA4900VA-FINAL-PROJECT.git
 cd DSA4900VA-FINAL-PROJECT
 
 
-2. **Run R Forecasting**:
-- Open `MatchaHaven1 Improved model.Rmd` in RStudio.
-- Knit (Ctrl+Shift+K) to HTML/PDF: Outputs forecasts, plots, and regression.
-- Key Result: 12-week ensemble (ARIMA/ETS avg); export CSV for Power BI.
+Run Forecasting in RStudio
 
-3. **Launch Power BI Dashboard**:
-- Open the published link: [Live Dashboard](https://app.powerbi.com/view?r=eyJrIjoiZTgzYzNmNjMtZDM2MS00YzIzLThmMTAtNDQ0ZmU3NDAyNTI1IiwidCI6IjE2ZDgzZWU2LTI1NGEtNDY5ZC1hNmNjLTU0ZTJjYTIzMTNlNyIsImMiOjh9).
-- Or load local .pbix: Refresh data > Interact with slicers (e.g., filter by Date/OrderType).
-- Pages:
-  - **Sales & Revenue**: Trends, category bars, order pies (DAX: [Total Revenue] = SUM(TotalAmount)).
-  - **Employee Performance**: Shift productivity, sales/employee (DAX: [Avg Sales/Day] = DIVIDE(SUM(Sales), DISTINCTCOUNT(Date))).
-  - **Customer Trends**: Top items, spending summaries (DAX: [Growth %] = [Total] / CALCULATE([Total], PREVIOUSMONTH(Date))).
-  - **Forecasting & Regression**: R-embedded lines/bars for Q4 (e.g., weekly KSh 463K avg).
+Open MatchaHaven1 Improved model.Rmd
 
-4. **Generate Reports**:
-- Knit `MatchaHaven Baseline Model.Rmd` for lm baseline comparison.
-- Export to Word/PDF via RStudio.
+Knit to generate forecasts, regression tables, and visual outputs
 
-## 📁 Key Files & Structure
+Export the twelve week forecast to CSV for Power BI
+
+Open the Power BI Dashboard
+
+Use the live link above or open MatchaHaven1.pbix
+
+Refresh data and explore the slicers:
+
+Date
+
+Name
+
+Order Type
+
+Payment Method
+
+Category
+
+📁 Project Structure
 DSA4900VA-FINAL-PROJECT/
-├── MatchaHaven1 Improved model.Rmd     # Main RMarkdown: ARIMA/ETS forecasts + regression
-├── MatchaHaven Baseline Model.Rmd      # Baseline linear model
-├── MatchaHaven1.xlsx                   # Raw manual data (17,577 rows)
-├── Matcha Forecasting Report.xlsx      # Excel summary of KPIs/forecasts
-├── MatchaHaven1.pbix                   # Power BI report file
-├── theme.json                          # Power BI custom theme (Matcha greens)
-└── README.md                           # This file
+├── MatchaHaven1 Improved model.Rmd
+├── MatchaHaven Baseline Model.Rmd
+├── MatchaHaven1.xlsx
+├── Matcha Forecasting Report.xlsx
+├── MatchaHaven1.pbix
+├── theme.json
+└── README.md
 
+📊 Dashboard Pages and Key Insights
+Page 1: Sales and Revenue
 
-## 📈 Results & Insights
-- **Forecast**: Q4 KSh 5.56M total (weekly avg KSh 463K); Sat/Sun peaks ~KSh 80K/day.
-- **Insights**: Delivery/Takeaway 76% orders (KSh 8K avg); top item (Classic Mojito) KSh 949K; DAX trends show 2-3% WoW growth.
-- **Model Perf**: Ensemble RMSE 13K (93% better than baseline lm, MAPE <16%).
-- **Dashboard Highlights**: DAX enables what-ifs (e.g., [YoY Growth] = DIVIDE([Total] - SAMEPERIODLASTYEAR([Total]), SAMEPERIODLASTYEAR([Total]))); slicers for DayOfWeek/OrderType.
+This page gives a full view of Matcha Haven’s daily revenue performance.
 
-See report for visuals (e.g., forecast line with intervals, weekly bars).
+Key Visuals
 
-## 🤝 Contributing
-- Fork the repo and submit PRs for improvements (e.g., add holiday regressors).
-- Issues: Report bugs or suggest DAX tweaks.
-- Contact: oanis@usiu.ac.ke
+Revenue Growth Over Time (daily line chart)
+
+Revenue by Category (Mojitos, Matcha, Specialty Matcha, Tea and Hot Drinks, Cold Coffee, Cakes, Desserts, Extras)
+
+Revenue by Item Name (top performing drinks)
+
+Order Type Distribution (dine in, takeaway, delivery)
+
+Payment Method Breakdown (MPesa, cash, card)
+
+KPIs
+
+Total Revenue: KSh 12.723M
+
+Total Transactions: 17.577K
+
+Average Daily Revenue: KSh 69.524K
+
+Page 2: Inventory
+
+Shows stock behaviour, waste patterns, and average inventory stability.
+
+Key Visuals
+
+Top five wasted items
+
+Average Closing Stock by Category
+
+Average Opening Stock by Category
+
+Total Sales vs Total Purchases (trend line)
+
+Inventory Table Includes
+
+Average Opening Stock
+
+Average Closing Stock
+
+Reorder Point
+
+Target Stock
+
+Average Daily Sales
+
+Net Stock Movement
+
+Page 3: Employee Performance
+
+Analyzes staff productivity across shifts, hours, and payment methods.
+
+Key Visuals
+
+Employee profile list
+
+Shift Based Employee Productivity (stacked bar chart)
+
+Monthly Performance Trend (line area chart)
+
+Sales by Employee (split by payment method)
+
+Orders Handled per Employee
+
+Average Sale Value per Employee
+
+Average Sales Per Employee Per Day
+
+Average Transactions Per Employee Per Day
+
+Top Performer
+
+Walter with about KSh 4.293M revenue
+
+Page 4: Customer Trends
+
+Shows how customers behave, what they buy, and when they spend.
+
+Key Visuals
+
+Percentage of Sales by Shift Hours (heatmap style)
+
+Average Spending Per Order Type (dine in, takeaway, delivery)
+
+Customer Spending Summary
+
+Average: KSh 723.84
+
+Minimum: KSh 80
+
+Maximum: KSh 4500
+
+Median: KSh 500
+
+Customer Payment Preferences (donut chart)
+
+Sales According to Day of the Week
+
+Top five best selling drinks
+
+Top five best selling food items
+
+Page 5: Forecasting and Regression Analysis (Q4 2025)
+
+Merges RStudio model outputs with BI visuals.
+
+Key Visuals
+
+Historical Revenue and Random Forest Forecast for Oct 1 to Dec 23 2025
+
+Forecast KPIs (daily average, weekly average, total for 12 weeks)
+
+Model Comparison Table showing RMSE, MAE, MAPE
+
+Forecast Summary
+
+Twelve week projected revenue: about KSh 5.9M
+
+Daily average: about KSh 69538
+
+Weekly average: about KSh 449321
+
+RF model gives the most stable and accurate performance
+
+📈 Results and Insights
+
+Q4 forecast: about KSh 5.9M
+
+Weekend revenue peaks remain strong
+
+Delivery and takeaway remain dominant
+
+Classic Mojito remains top seller
+
+Lotus Milkcake leads food items
+
+Forecast models agree strongly (correlations above 0.9)
+
+🤝 Contributing
+
+Fork and submit pull requests for improvements
+
+Suggest enhancements using GitHub Issues
+
+Contact: oanis@usiu.ac.ke
 
 ## 📄 License
 MIT License—use freely for non-commercial SME analytics. © 2025 Omar Anis A. Mohamud (USIU-Africa DSA4900VA).
