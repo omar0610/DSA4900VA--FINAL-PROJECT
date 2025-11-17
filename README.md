@@ -35,8 +35,8 @@ Helps Matcha Haven:
 
 1. **Clone the Repository**
 git clone https://github.com/omar0610/DSA4900VA-FINAL-PROJECT.git
-
 cd DSA4900VA-FINAL-PROJECT
+
 2. **Run Forecasting in RStudio**
 - Open `MatchaHaven1 Improved model.Rmd`
 - Knit to generate forecasts, regression tables, and visual outputs
